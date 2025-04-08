@@ -3,3 +3,4 @@ torchvision>=0.20.1
 diffusers>=0.32.1
 transformers>=4.47.1
 einops>=0.7.0
+accelerate>=1.6.0
