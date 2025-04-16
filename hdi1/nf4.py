@@ -1,6 +1,11 @@
 import torch
-from transformers import AutoTokenizer, LlamaForCausalLM
-from accelerate import init_empty_weights
+from transformers import (
+    AutoTokenizer,
+    LlamaForCausalLM,
+    BitsAndBytesConfig,
+    AutoModel
+)
+from accelerate import load_checkpoint_and_dispatch
 import warnings
 from . import HiDreamImagePipeline, HiDreamImageTransformer2DModel
 from .schedulers.fm_solvers_unipc import FlowUniPCMultistepScheduler
@@ -21,7 +26,8 @@ MODEL_CONFIGS = {
         "shift": 6.0,
         "scheduler": FlashFlowMatchEulerDiscreteScheduler,
         "dtype": torch.float16,
-        "quant": "nf4"
+        "quant": "nf4",
+        "device_map": "balanced"
     },
     "full": {
         "path": f"{MODEL_PREFIX}/HiDream-I1-Full-nf4",
@@ -30,7 +36,8 @@ MODEL_CONFIGS = {
         "shift": 3.0,
         "scheduler": FlowUniPCMultistepScheduler,
         "dtype": torch.bfloat16,
-        "quant": "fp16"
+        "quant": "fp16",
+        "device_map": "sequential"
     },
     "fast": {
         "path": f"{MODEL_PREFIX}/HiDream-I1-Fast-nf4",
@@ -39,7 +46,8 @@ MODEL_CONFIGS = {
         "shift": 3.0,
         "scheduler": FlashFlowMatchEulerDiscreteScheduler,
         "dtype": torch.float16,
-        "quant": "int4"
+        "quant": "int4",
+        "device_map": "auto"
     }
 }
 
@@ -49,53 +57,66 @@ def log_vram(msg: str):
 def load_models(model_type: str):
     config = MODEL_CONFIGS[model_type]
     
-    with init_empty_weights():
-        # Load tokenizer with truncation
-        tokenizer = AutoTokenizer.from_pretrained(
-            LLAMA_MODEL_NAME,
-            truncation=True,
-            model_max_length=77
+    # Configure 4-bit quantization
+    bnb_config = None
+    if config["quant"] == "int4":
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=config["dtype"],
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4"
         )
-        log_vram("✅ Tokenizer initialized")
 
-        # Quantized text encoder
-        text_encoder = LlamaForCausalLM.from_pretrained(
-            LLAMA_MODEL_NAME,
-            device_map="auto",
-            torch_dtype=config["dtype"],
-            attn_implementation="flash_attention_2",
-            load_in_4bit=(config["quant"] == "int4"),
-            bnb_4bit_compute_dtype=config["dtype"]
-        )
-        log_vram("✅ Text encoder loaded")
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        LLAMA_MODEL_NAME,
+        truncation=True,
+        model_max_length=77
+    )
+    log_vram("✅ Tokenizer initialized")
 
-        # Transformer with memory optimization
-        transformer = HiDreamImageTransformer2DModel.from_pretrained(
+    # Load text encoder with proper device mapping
+    text_encoder = LlamaForCausalLM.from_pretrained(
+        LLAMA_MODEL_NAME,
+        device_map=config["device_map"],
+        torch_dtype=config["dtype"],
+        quantization_config=bnb_config,
+        attn_implementation="flash_attention_2"
+    )
+    log_vram("✅ Text encoder loaded")
+
+    # Load transformer with sharding
+    transformer = load_checkpoint_and_dispatch(
+        HiDreamImageTransformer2DModel.from_pretrained(
             config["path"],
             subfolder="transformer",
             torch_dtype=config["dtype"],
-            device_map="sequential"
-        )
-        log_vram("✅ Transformer loaded")
+            device_map=config["device_map"],
+            no_split_module_classes=["TransformerBlock"]
+        ),
+        checkpoint=config["path"],
+        device_map=config["device_map"]
+    )
+    log_vram("✅ Transformer loaded")
 
-        # Pipeline configuration
-        pipe = HiDreamImagePipeline.from_pretrained(
-            config["path"],
-            scheduler=config["scheduler"](
-                num_train_timesteps=1000,
-                shift=config["shift"],
-                use_dynamic_shifting=False
-            ),
-            tokenizer_4=tokenizer,
-            text_encoder_4=text_encoder,
-            torch_dtype=config["dtype"],
-            variant=config["quant"]
-        )
-        pipe.transformer = transformer
-        log_vram("✅ Pipeline initialized")
+    # Initialize pipeline
+    pipe = HiDreamImagePipeline.from_pretrained(
+        config["path"],
+        scheduler=config["scheduler"](
+            num_train_timesteps=1000,
+            shift=config["shift"],
+            use_dynamic_shifting=False
+        ),
+        tokenizer_4=tokenizer,
+        text_encoder_4=text_encoder,
+        transformer=transformer,
+        torch_dtype=config["dtype"],
+        device_map=config["device_map"]
+    )
+    log_vram("✅ Pipeline initialized")
 
-    # Memory optimization techniques
-    pipe.enable_model_cpu_offload()
+    # Memory optimization
+    pipe.enable_sequential_cpu_offload()
     pipe.enable_vae_slicing()
     pipe.enable_xformers_memory_efficient_attention()
     
@@ -116,7 +137,7 @@ def generate_image(
     
     generator = torch.Generator("cuda").manual_seed(seed)
     
-    # Token truncation with proper padding
+    # Process prompt with proper truncation
     inputs = pipe.tokenizer_4(
         prompt,
         return_tensors="pt",
