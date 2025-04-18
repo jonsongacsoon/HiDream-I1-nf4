@@ -5,6 +5,7 @@ from hi_diffusers import HiDreamImageTransformer2DModel
 from hi_diffusers.schedulers.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from hi_diffusers.schedulers.flash_flow_match import FlashFlowMatchEulerDiscreteScheduler
 from transformers import LlamaForCausalLM, PreTrainedTokenizerFast
+from transformers import BitsAndBytesConfig
 
 MODEL_PREFIX = "HiDream-ai"
 LLAMA_MODEL_NAME = "meta-llama/Meta-Llama-3.1-8B-Instruct"
@@ -49,32 +50,37 @@ RESOLUTION_OPTIONS = [
 def load_models(model_type):
     config = MODEL_CONFIGS[model_type]
     pretrained_model_name_or_path = config["path"]
-    scheduler = MODEL_CONFIGS[model_type]["scheduler"](num_train_timesteps=1000, shift=config["shift"], use_dynamic_shifting=False)
-    
+    scheduler = FlowUniPCMultistepScheduler(
+        num_train_timesteps=1000, shift=config["shift"], use_dynamic_shifting=False
+    )
+    quantization_config = BitsAndBytesConfig(load_in_4bit=True)
     tokenizer_4 = PreTrainedTokenizerFast.from_pretrained(
         LLAMA_MODEL_NAME,
-        use_fast=False)
-    
+        use_fast=False,
+    )
     text_encoder_4 = LlamaForCausalLM.from_pretrained(
         LLAMA_MODEL_NAME,
         output_hidden_states=True,
         output_attentions=True,
-        torch_dtype=torch.bfloat16).to("cuda")
-
+        torch_dtype=torch.bfloat16,
+        quantization_config=quantization_config,
+        low_cpu_mem_usage=True,
+    ).to("cuda")
     transformer = HiDreamImageTransformer2DModel.from_pretrained(
-        pretrained_model_name_or_path, 
-        subfolder="transformer", 
-        torch_dtype=torch.bfloat16).to("cuda")
-
+        pretrained_model_name_or_path,
+        subfolder="transformer",
+        torch_dtype=torch.bfloat16,
+        quantization_config=quantization_config,
+        low_cpu_mem_usage=True,
+    ).to("cuda")
     pipe = HiDreamImagePipeline.from_pretrained(
-        pretrained_model_name_or_path, 
+        pretrained_model_name_or_path,
         scheduler=scheduler,
         tokenizer_4=tokenizer_4,
         text_encoder_4=text_encoder_4,
-        torch_dtype=torch.bfloat16
-    ).to("cuda", torch.bfloat16)
+        torch_dtype=torch.bfloat16,
+    ).to("cuda")
     pipe.transformer = transformer
-    
     return pipe, config
 
 # Parse resolution string to get height and width
